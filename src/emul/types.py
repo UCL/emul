@@ -18,8 +18,20 @@ CovarianceFunction = Callable[[ArrayLike, ArrayLike, ParametersDict], Array]
 NegativeLogMarginalLikelihood = Callable[[ParametersDict], Array]
 """Type alias for negative marginal likelihood function for Gaussian process model."""
 
-PredictiveMeanAndVariance = Callable[[ArrayLike, ParametersDict], tuple[Array, Array]]
-"""Type alias for predictive mean and variance function for Gaussian process model."""
+PosteriorPredictiveMeanAndVariance = Callable[[ArrayLike], tuple[Array, Array]]
+"""Type alias for posterior predictive mean and variance function."""
+
+PosteriorPredictiveLookaheadVarianceReduction = Callable[[ArrayLike, ArrayLike], Array]
+"""Type alias for posterior predictive lookahead variance reduction function."""
+
+PosteriorPredictiveFunctionFactory = Callable[
+    [ParametersDict],
+    tuple[
+        PosteriorPredictiveMeanAndVariance,
+        PosteriorPredictiveLookaheadVarianceReduction,
+    ],
+]
+"""Type alias for function used to construct posterior predictive functions."""
 
 
 class DataDict(TypedDict):

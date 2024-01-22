@@ -14,7 +14,9 @@ from .types import (
     MeanFunction,
     NegativeLogMarginalLikelihood,
     ParametersDict,
-    PredictiveMeanAndVariance,
+    PosteriorPredictiveFunctionFactory,
+    PosteriorPredictiveLookaheadVarianceReduction,
+    PosteriorPredictiveMeanAndVariance,
 )
 
 
@@ -39,7 +41,7 @@ def gaussian_process_with_isotropic_gaussian_observations(
     data: DataDict,
     mean_function: MeanFunction,
     covariance_function: CovarianceFunction,
-) -> tuple[NegativeLogMarginalLikelihood, PredictiveMeanAndVariance]:
+) -> tuple[NegativeLogMarginalLikelihood, PosteriorPredictiveFunctionFactory]:
     """Gaussian process observed with isotropic Gaussian noise."""
     (
         vmap_mean_function,
@@ -79,32 +81,82 @@ def gaussian_process_with_isotropic_gaussian_observations(
             + jnp.log(chol_marginal_covariance_matrix.diagonal()).sum()
         )
 
-    def predictive_mean_and_variance(
-        new_input: ArrayLike, parameters: ParametersDict
-    ) -> tuple[Array, Array]:
-        covar_old_new = vmap_covariance_function(data["inputs"], new_input, parameters)
-        covar_new_new = covariance_function(new_input, new_input, parameters)
+    def get_posterior_predictive_functions(
+        parameters: ParametersDict,
+    ) -> tuple[
+        PosteriorPredictiveMeanAndVariance,
+        PosteriorPredictiveLookaheadVarianceReduction,
+    ]:
         zero_mean_outputs = data["outputs"] - vmap_mean_function(
             data["inputs"],
             parameters,
         )
         chol_marginal_covariance_matrix = chol_marginal_covariance_function(parameters)
-        inv_marginal_covariance_covar_new_new = jsp.linalg.cho_solve(
-            (chol_marginal_covariance_matrix, True),
-            covar_old_new,
-        )
-        mean = (
-            mean_function(new_input, parameters)
-            + inv_marginal_covariance_covar_new_new @ zero_mean_outputs
-        )
-        variance = (
-            covar_new_new
-            + parameters["observation_noise_std"] ** 2
-            - inv_marginal_covariance_covar_new_new @ covar_old_new
-        )
-        return mean, variance
 
-    return neg_log_marginal_likelihood, predictive_mean_and_variance
+        def posterior_covariance_function(
+            input_1: ArrayLike, input_2: ArrayLike
+        ) -> Array:
+            return covariance_function(
+                input_1, input_2, parameters
+            ) - jsp.linalg.cho_solve(
+                (chol_marginal_covariance_matrix, True),
+                vmap_covariance_function(data["inputs"], input_1, parameters),
+            ) @ vmap_covariance_function(
+                data["inputs"], input_2, parameters
+            )
+
+        vmap_posterior_covariance_function = jax.vmap(
+            posterior_covariance_function, in_axes=(0, None)
+        )
+        vmap_vmap_posterior_covariance_function = jax.vmap(
+            vmap_posterior_covariance_function,
+            in_axes=(None, 0),
+        )
+
+        def posterior_mean_and_variance_function(input_: ArrayLike) -> Array:
+            covariance_data_input = vmap_covariance_function(
+                data["inputs"], input_, parameters
+            )
+            inv_marginal_covariance_covariance_data_input = jsp.linalg.cho_solve(
+                (chol_marginal_covariance_matrix, True),
+                covariance_data_input,
+            )
+            mean = (
+                mean_function(input_, parameters)
+                + inv_marginal_covariance_covariance_data_input @ zero_mean_outputs
+            )
+            variance = (
+                covariance_function(input_, input_, parameters)
+                - inv_marginal_covariance_covariance_data_input @ covariance_data_input
+            )
+            return mean, variance
+
+        def posterior_lookahead_variance_reduction_function(
+            new_input: ArrayLike, pending_inputs: ArrayLike
+        ) -> Array:
+            marginal_covariance_pending = vmap_vmap_posterior_covariance_function(
+                pending_inputs, pending_inputs
+            )
+            marginal_covariance_pending.at[  # noqa: PD008
+                jnp.diag_indices(marginal_covariance_pending.shape[0])
+            ].add(
+                parameters["observation_noise_std"] ** 2,
+            )
+            chol_covariance_pending = jnp.linalg.cholesky(marginal_covariance_pending)
+            covariance_pending_new = vmap_posterior_covariance_function(
+                pending_inputs, new_input
+            )
+            return covariance_pending_new @ jsp.linalg.cho_solve(
+                (chol_covariance_pending, True),
+                covariance_pending_new,
+            )
+
+        return (
+            posterior_mean_and_variance_function,
+            posterior_lookahead_variance_reduction_function,
+        )
+
+    return neg_log_marginal_likelihood, get_posterior_predictive_functions
 
 
 def gaussian_process_with_direct_observations_and_reduced_rank(
@@ -112,7 +164,7 @@ def gaussian_process_with_direct_observations_and_reduced_rank(
     mean_function: MeanFunction,
     covariance_function: CovarianceFunction,
     rank: int,
-) -> tuple[NegativeLogMarginalLikelihood, PredictiveMeanAndVariance]:
+) -> tuple[NegativeLogMarginalLikelihood, PosteriorPredictiveFunctionFactory]:
     """Directly observed Gaussian process with reduced-rank covariance."""
     (
         vmap_mean_function,
@@ -143,30 +195,86 @@ def gaussian_process_with_direct_observations_and_reduced_rank(
             + jnp.log(eigenvalues[-rank:]).sum() / 2
         )
 
-    def predictive_mean_and_variance(
-        new_input: ArrayLike, parameters: ParametersDict
-    ) -> tuple[Array, Array]:
-        kernel_old_new = vmap_covariance_function(data["inputs"], new_input, parameters)
-        kernel_new_new = covariance_function(new_input, new_input, parameters)
+    def get_posterior_predictive_functions(
+        parameters: ParametersDict,
+    ) -> tuple[
+        PosteriorPredictiveMeanAndVariance,
+        PosteriorPredictiveLookaheadVarianceReduction,
+    ]:
         zero_mean_outputs = data["outputs"] - vmap_mean_function(
             data["inputs"],
             parameters,
         )
-        eigenvalues, eigenvectors = eigh_marginal_covariance_function(parameters)
-        projected_covar_old_new = kernel_old_new @ eigenvectors[:, -rank:]
-        mean = mean_function(new_input, parameters) + (
-            projected_covar_old_new
-            / eigenvalues[-rank:]
-            @ eigenvectors[:, -rank:].T
-            @ zero_mean_outputs
-        )
-        variance = (
-            kernel_new_new
-            - (projected_covar_old_new / eigenvalues[-rank:]) @ projected_covar_old_new
-        )
-        return mean, variance
+        eigenvectors, eigenvalues = eigh_marginal_covariance_function(parameters)
 
-    return neg_log_marginal_likelihood, predictive_mean_and_variance
+        def posterior_covariance_function(
+            input_1: ArrayLike, input_2: ArrayLike
+        ) -> Array:
+            return covariance_function(input_1, input_2, parameters) - (
+                (
+                    vmap_covariance_function(data["inputs"], input_1, parameters)
+                    @ eigenvectors[:, -rank:]
+                )
+                / eigenvalues[-rank:]
+            ) @ vmap_covariance_function(data["inputs"], input_2, parameters)
+
+        vmap_posterior_covariance_function = jax.vmap(
+            posterior_covariance_function, in_axes=(0, None)
+        )
+        vmap_vmap_posterior_covariance_function = jax.vmap(
+            vmap_posterior_covariance_function,
+            in_axes=(None, 0),
+        )
+
+        def posterior_mean_and_variance_function(input_: ArrayLike) -> Array:
+            covariance_data_input = vmap_covariance_function(
+                data["inputs"], input_, parameters
+            )
+            inv_marginal_covariance_covariance_data_input = (
+                (covariance_data_input @ eigenvectors[:, -rank:]) / eigenvalues[-rank:]
+            ) @ eigenvectors[:, -rank:].T
+            mean = (
+                mean_function(input_, parameters)
+                + inv_marginal_covariance_covariance_data_input @ zero_mean_outputs
+            )
+            variance = (
+                covariance_function(input_, input_, parameters)
+                - inv_marginal_covariance_covariance_data_input @ covariance_data_input
+            )
+            return mean, variance
+
+        def posterior_lookahead_variance_reduction_function(
+            new_input: ArrayLike, pending_inputs: ArrayLike
+        ) -> Array:
+            marginal_covariance_pending = vmap_vmap_posterior_covariance_function(
+                pending_inputs, pending_inputs
+            )
+            marginal_covariance_pending.at[  # noqa: PD008
+                jnp.diag_indices(marginal_covariance_pending.shape[0])
+            ].add(
+                parameters["observation_noise_std"] ** 2,
+            )
+            eigenvectors_pending, eigenvalues_pending = jnp.linalg.eigh(
+                marginal_covariance_pending
+            )
+            covariance_pending_new = vmap_posterior_covariance_function(
+                pending_inputs, new_input
+            )
+            return (
+                covariance_pending_new
+                @ (
+                    (covariance_pending_new @ eigenvectors_pending[:, -rank:])
+                    / eigenvalues_pending[-rank:]
+                )
+                @ eigenvectors_pending[:, -rank:].T
+            )
+
+        return (
+            posterior_mean_and_variance_function,
+            posterior_lookahead_variance_reduction_function,
+        )
+
+    return neg_log_marginal_likelihood, get_posterior_predictive_functions
 
 
 def gaussian_process_with_direct_observations_and_clipping(
@@ -174,7 +282,7 @@ def gaussian_process_with_direct_observations_and_clipping(
     mean_function: MeanFunction,
     covariance_function: CovarianceFunction,
     eigenvalue_threshold: float = 1e-8,
-) -> tuple[NegativeLogMarginalLikelihood, PredictiveMeanAndVariance]:
+) -> tuple[NegativeLogMarginalLikelihood, PosteriorPredictiveFunctionFactory]:
     """Directly observed Gaussian process with clipping of covariance eigenvalues."""
     (
         vmap_mean_function,
@@ -230,4 +338,87 @@ def gaussian_process_with_direct_observations_and_clipping(
         )
         return mean, variance
 
-    return neg_log_marginal_likelihood, predictive_mean_and_variance
+    def get_posterior_predictive_functions(
+        parameters: ParametersDict,
+    ) -> tuple[
+        PosteriorPredictiveMeanAndVariance,
+        PosteriorPredictiveLookaheadVarianceReduction,
+    ]:
+        zero_mean_outputs = data["outputs"] - vmap_mean_function(
+            data["inputs"],
+            parameters,
+        )
+        eigenvectors, eigenvalues = eigh_marginal_covariance_function(parameters)
+        clipped_eigenvalues = jnp.clip(eigenvalues, eigenvalue_threshold)
+
+        def posterior_covariance_function(
+            input_1: ArrayLike, input_2: ArrayLike
+        ) -> Array:
+            return covariance_function(input_1, input_2, parameters) - (
+                (
+                    vmap_covariance_function(data["inputs"], input_1, parameters)
+                    @ eigenvectors
+                )
+                / clipped_eigenvalues
+            ) @ vmap_covariance_function(data["inputs"], input_2, parameters)
+
+        vmap_posterior_covariance_function = jax.vmap(
+            posterior_covariance_function, in_axes=(0, None)
+        )
+        vmap_vmap_posterior_covariance_function = jax.vmap(
+            vmap_posterior_covariance_function,
+            in_axes=(None, 0),
+        )
+
+        def posterior_mean_and_variance_function(input_: ArrayLike) -> Array:
+            covariance_data_input = vmap_covariance_function(
+                data["inputs"], input_, parameters
+            )
+            inv_marginal_covariance_covariance_data_input = (
+                (covariance_data_input @ eigenvectors) / clipped_eigenvalues
+            ) @ eigenvectors.T
+            mean = (
+                mean_function(input_, parameters)
+                + inv_marginal_covariance_covariance_data_input @ zero_mean_outputs
+            )
+            variance = (
+                covariance_function(input_, input_, parameters)
+                - inv_marginal_covariance_covariance_data_input @ covariance_data_input
+            )
+            return mean, variance
+
+        def posterior_lookahead_variance_reduction_function(
+            new_input: ArrayLike, pending_inputs: ArrayLike
+        ) -> Array:
+            marginal_covariance_pending = vmap_vmap_posterior_covariance_function(
+                pending_inputs, pending_inputs
+            )
+            marginal_covariance_pending.at[  # noqa: PD008
+                jnp.diag_indices(marginal_covariance_pending.shape[0])
+            ].add(
+                parameters["observation_noise_std"] ** 2,
+            )
+            eigenvectors_pending, eigenvalues_pending = jnp.linalg.eigh(
+                marginal_covariance_pending
+            )
+            clipped_eigenvalues_pending = jnp.clip(
+                eigenvalues_pending, eigenvalue_threshold
+            )
+            covariance_pending_new = vmap_posterior_covariance_function(
+                pending_inputs, new_input
+            )
+            return (
+                covariance_pending_new
+                @ (
+                    (covariance_pending_new @ eigenvectors_pending)
+                    / clipped_eigenvalues_pending
+                )
+                @ eigenvectors_pending.T
+            )
+
+        return (
+            posterior_mean_and_variance_function,
+            posterior_lookahead_variance_reduction_function,
+        )
+
+    return neg_log_marginal_likelihood, get_posterior_predictive_functions
